@@ -1,30 +1,26 @@
-import asyncio
-from datetime import datetime
-import os
-from typing import List, Optional
-import uvicorn
-from fastapi import FastAPI, HTTPException
+"""
+UBP Bank Agent -- Mock/Demo Backend
+Simulates Lloyds Bank workflows (mortgage affordability + subscription
+payment history) with fake but *consistent* per-customer data, so the
+same customer_id always gets the same numbers across repeated calls.
+No real banking data or integration -- purely for testing the
+gateway <-> agent <-> AI-assistant pipeline end-to-end.
+"""
+
+import hashlib
+import random
+import re
+from datetime import datetime, timedelta
+from typing import Literal
+
+from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import HTMLResponse
 from pydantic import BaseModel, Field
 
-# Optional Gemini Integration (Falls back safely if GEMINI_API_KEY is not set)
-import google.generativeai as genai
-
-GEMINI_API_KEY = os.environ.get("GEMINI_API_KEY", "")
-if GEMINI_API_KEY:
-  genai.configure(api_key=GEMINI_API_KEY)
-  gemini_model = genai.GenerativeModel("gemini-1.5-flash")
-else:
-  gemini_model = None
-
 app = FastAPI(
-    title="Lloyds Bank Open UBP & Gemini Agent",
-    version="2.0.0",
-    description=(
-        "Open Universal Banking Protocol (UBP) server with Gemini-powered"
-        " Mortgage & Subscription Workflows."
-    ),
+    title="UBP Bank Agent (Mock)",
+    version="1.0.0",
+    description="Mock Lloyds Bank agent -- mortgage affordability & subscription history.",
 )
 
 app.add_middleware(
@@ -35,400 +31,219 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-# In-Memory State Storage for Real-Time UI Visibility
-system_state = {
-    "active_steps": [],
-    "bank_checks": [],
-    "negotiation_logs": [],
-    "chat_logs": [],
-}
 
-
-class UBPMessageRequest(BaseModel):
-  customer_id: str
-  workflow_type: str = Field(
-      ..., description="mortgage or subscription workflow"
-  )
-  query: str = Field(
-      ..., description="User request text coming from ChatGPT via UBP"
-  )
-  parameters: dict = Field(
-      default={}, description="Financial properties or query details"
-  )
-
-
-class BankAgentResponse(BaseModel):
-  status: str
-  workflow: str
-  agent_response: str
-  financial_metrics: dict
-  execution_steps: List[str]
-  audit_checks: List[dict]
-  negotiation_or_analysis_log: List[str]
-
-
-def log_activity(step: str, check: dict, log_entry: str, chat: dict):
-  if step:
-    system_state["active_steps"].append(
-        {"timestamp": datetime.now().strftime("%H:%M:%S"), "step": step}
+class AgentRequest(BaseModel):
+    customer_id: str = Field(..., description="Unique customer identifier")
+    workflow_type: Literal["mortgage", "subscription"] = Field(
+        ..., description="Either 'mortgage' or 'subscription'"
     )
-  if check:
-    system_state["bank_checks"].append(
-        {"timestamp": datetime.now().strftime("%H:%M:%S"), **check}
-    )
-  if log_entry:
-    system_state["negotiation_logs"].append(
-        {"timestamp": datetime.now().strftime("%H:%M:%S"), "log": log_entry}
-    )
-  if chat:
-    system_state["chat_logs"].append(
-        {"timestamp": datetime.now().strftime("%H:%M:%S"), **chat}
-    )
+    query: str = Field(..., description="Original natural language prompt")
+    parameters: dict = Field(default_factory=dict, description="Extracted parameters")
 
 
-# --- HTML UI Dashboard Endpoint ---
-@app.get("/", response_class=HTMLResponse)
-async def serve_dashboard():
-  return """
-<!DOCTYPE html>
-<html lang="en">
-<head>
-    <meta charset="UTF-8">
-    <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>Lloyds Bank Agent - Open UBP Dashboard</title>
-    <script src="https://cdn.tailwindcss.com"></script>
-    <style>
-        .glass-panel { background: rgba(15, 23, 42, 0.85); backdrop-filter: blur(12px); border: 1px solid rgba(255, 255, 255, 0.1); }
-    </style>
-</head>
-<body class="bg-slate-950 text-slate-100 font-sans min-h-screen p-6">
-    <header class="max-w-7xl mx-auto mb-8 flex flex-col md:flex-row justify-between items-center border-b border-slate-800 pb-4">
-        <div>
-            <h1 class="text-3xl font-extrabold tracking-tight text-emerald-400 flex items-center gap-3">
-                <span class="bg-emerald-500 text-slate-950 px-3 py-1 rounded-lg text-sm">Open UBP</span> 
-                Lloyds Bank Agent (Gemini-Powered)
-            </h1>
-            <p class="text-slate-400 text-sm mt-1">Workflows: Mortgage (Maximize Bank Profit) & Subscriptions (Distribution & Audits)</p>
-        </div>
-        <div class="mt-4 md:mt-0 flex items-center gap-3">
-            <button onclick="triggerWorkflow('mortgage')" class="bg-emerald-600 hover:bg-emerald-500 text-slate-950 font-bold px-4 py-2 rounded-lg text-sm transition shadow-lg shadow-emerald-900/40">
-                Test Mortgage Workflow
-            </button>
-            <button onclick="triggerWorkflow('subscription')" class="bg-cyan-600 hover:bg-cyan-500 text-slate-950 font-bold px-4 py-2 rounded-lg text-sm transition shadow-lg shadow-cyan-900/40">
-                Test Subscription Workflow
-            </button>
-        </div>
-    </header>
+# ---------------------------------------------------------------------------
+# Deterministic mock-data helpers
+# Every value is derived from a hash of customer_id, so the SAME customer_id
+# always produces the SAME income/deposit/payment-history on every call --
+# it's fake, but it's consistent, which is what makes it usable for testing.
+# ---------------------------------------------------------------------------
 
-    <main class="max-w-7xl mx-auto grid grid-cols-1 md:grid-cols-2 gap-6">
-        <!-- PART 1: Live Chat Log -->
-        <section class="glass-panel rounded-2xl p-5 flex flex-col h-[400px]">
-            <div class="flex items-center justify-between border-b border-slate-800 pb-3 mb-3">
-                <h2 class="font-semibold text-lg text-slate-200">💬 Part 1: Chat Log (ChatGPT ⇄ UBP ⇄ Bank)</h2>
-                <span class="text-xs bg-slate-800 text-emerald-400 px-2.5 py-1 rounded-full">Live Tunnel</span>
-            </div>
-            <div id="chat-logs" class="flex-1 overflow-y-auto space-y-3 pr-2 text-sm">
-                <div class="text-slate-500 text-center italic mt-10">Click a test workflow button above to start...</div>
-            </div>
-        </section>
-
-        <!-- PART 2: Bank Checks -->
-        <section class="glass-panel rounded-2xl p-5 flex flex-col h-[400px]">
-            <div class="flex items-center justify-between border-b border-slate-800 pb-3 mb-3">
-                <h2 class="font-semibold text-lg text-slate-200">🔒 Part 2: Bank Verification Checks</h2>
-                <span class="text-xs bg-slate-800 text-amber-400 px-2.5 py-1 rounded-full">Audits</span>
-            </div>
-            <div id="bank-checks" class="flex-1 overflow-y-auto space-y-2 pr-2 text-sm">
-                <div class="text-slate-500 text-center italic mt-10">No active audits triggered.</div>
-            </div>
-        </section>
-
-        <!-- PART 3: Negotiation / Analysis Loop -->
-        <section class="glass-panel rounded-2xl p-5 flex flex-col h-[400px]">
-            <div class="flex items-center justify-between border-b border-slate-800 pb-3 mb-3">
-                <h2 class="font-semibold text-lg text-slate-200">📈 Part 3: Negotiation & Profit Optimization</h2>
-                <span class="text-xs bg-slate-800 text-purple-400 px-2.5 py-1 rounded-full">Strategy Engine</span>
-            </div>
-            <div id="negotiation-logs" class="flex-1 overflow-y-auto space-y-3 pr-2 text-sm">
-                <div class="text-slate-500 text-center italic mt-10">Engine idling...</div>
-            </div>
-        </section>
-
-        <!-- PART 4: Execution Steps -->
-        <section class="glass-panel rounded-2xl p-5 flex flex-col h-[400px]">
-            <div class="flex items-center justify-between border-b border-slate-800 pb-3 mb-3">
-                <h2 class="font-semibold text-lg text-slate-200">⚙️ Part 4: Step Execution Pipeline</h2>
-                <span class="text-xs bg-slate-800 text-blue-400 px-2.5 py-1 rounded-full">Pipeline</span>
-            </div>
-            <div id="execution-steps" class="flex-1 overflow-y-auto space-y-3 pr-2 text-sm">
-                <div class="text-slate-500 text-center italic mt-10">Pipeline steps will render here.</div>
-            </div>
-        </section>
-    </main>
-
-    <script>
-        async function triggerWorkflow(type) {
-            let payload = type === 'mortgage' ? {
-                customer_id: "LLOYDS-CUST-991",
-                workflow_type: "mortgage",
-                query: "Can I get a £350,000 mortgage with a £50,000 deposit and £75,000 income?",
-                parameters: { loan_amount: 350000, deposit: 50000, income: 75000 }
-            } : {
-                customer_id: "LLOYDS-CUST-991",
-                workflow_type: "subscription",
-                query: "Did I pay my Sky subscription last month, and show me last year's subscription distribution.",
-                parameters: { lookback_period: "1_year" }
-            };
-
-            try {
-                await fetch('/ubp/v1/agent', {
-                    method: 'POST',
-                    headers: { 'Content-Type': 'application/json' },
-                    body: JSON.stringify(payload)
-                });
-                pollState();
-            } catch (err) { alert("Failed to trigger workflow."); }
-        }
-
-        async function pollState() {
-            try {
-                let res = await fetch('/ubp/v1/state');
-                let data = await res.json();
-                
-                let chatContainer = document.getElementById('chat-logs');
-                if (data.chat_logs.length > 0) {
-                    chatContainer.innerHTML = data.chat_logs.map(c => `
-                        <div class="p-2.5 rounded-lg ${c.sender.includes('ChatGPT') ? 'bg-slate-900 border border-slate-800 text-slate-300' : 'bg-emerald-950/40 border border-emerald-900/50 text-emerald-200'}">
-                            <div class="text-xs font-bold text-slate-400 mb-1">${c.sender} • ${c.timestamp}</div>
-                            <div>${c.text}</div>
-                        </div>
-                    `).join('');
-                    chatContainer.scrollTop = chatContainer.scrollHeight;
-                }
-
-                let checkContainer = document.getElementById('bank-checks');
-                if (data.bank_checks.length > 0) {
-                    checkContainer.innerHTML = data.bank_checks.map(b => `
-                        <div class="p-3 bg-slate-900/90 rounded-lg border border-slate-800 flex items-center justify-between">
-                            <div>
-                                <div class="font-medium text-slate-200">${b.check_name}</div>
-                                <div class="text-xs text-slate-400">${b.detail}</div>
-                            </div>
-                            <span class="text-xs font-extrabold px-2 py-1 rounded bg-amber-950 text-amber-400 border border-amber-800">${b.result}</span>
-                        </div>
-                    `).join('');
-                }
-
-                let negContainer = document.getElementById('negotiation-logs');
-                if (data.negotiation_logs.length > 0) {
-                    negContainer.innerHTML = data.negotiation_logs.map(n => `
-                        <div class="p-3 bg-purple-950/20 border border-purple-900/40 rounded-lg text-purple-200 text-xs leading-relaxed">
-                            <span class="font-bold text-purple-400">[Log] ${n.timestamp}:</span> ${n.log}
-                        </div>
-                    `).join('');
-                }
-
-                let stepContainer = document.getElementById('execution-steps');
-                if (data.active_steps.length > 0) {
-                    stepContainer.innerHTML = data.active_steps.map((s, idx) => `
-                        <div class="flex items-center gap-3 p-2 bg-slate-900 rounded-lg border border-slate-800 text-xs">
-                            <span class="w-5 h-5 rounded-full bg-blue-600 flex items-center justify-center font-bold text-slate-950">${idx + 1}</span>
-                            <span class="text-slate-300">${s.step}</span>
-                            <span class="ml-auto text-slate-500">${s.timestamp}</span>
-                        </div>
-                    `).join('');
-                }
-            } catch (err) {}
-        }
-        setInterval(pollState, 2000);
-    </script>
-</body>
-</html>
-  """
+def _seeded_rng(customer_id: str, salt: str = "") -> random.Random:
+    seed_material = f"{customer_id}:{salt}".encode()
+    seed = int(hashlib.sha256(seed_material).hexdigest(), 16)
+    return random.Random(seed)
 
 
-# --- UBP Endpoint Routing to Bank Agent & Gemini Workflows ---
-@app.post("/ubp/v1/agent", response_model=BankAgentResponse)
-async def process_ubp_request(payload: UBPMessageRequest):
-  steps = []
-  checks = []
-  logs = []
+def _mock_income(customer_id: str) -> int:
+    rng = _seeded_rng(customer_id, "income")
+    return rng.randrange(28_000, 95_000, 1_000)
 
-  # Log inbound request from Customer Agent (ChatGPT) via UBP
-  log_activity(
-      "Step 1: UBP Gateway intercepted message from ChatGPT Customer Agent",
-      None,
-      f"Received raw user query: '{payload.query}'",
-      {
-          "sender": "Customer Agent (ChatGPT)",
-          "text": payload.query,
-      },
-  )
-  await asyncio.sleep(0.3)
 
-  workflow = payload.workflow_type.lower()
-  response_text = ""
-  financial_metrics = {}
+def _mock_deposit_savings(customer_id: str) -> int:
+    rng = _seeded_rng(customer_id, "deposit")
+    return rng.randrange(8_000, 60_000, 1_000)
 
-  if workflow == "mortgage":
-    # --- MORTGAGE WORKFLOW: Maximize Bank Profit ---
-    step_desc = (
-        "Step 2: Executing mortgage affordability check and profit maximization"
-        " strategy"
-    )
-    steps.append(step_desc)
-    log_activity(step_desc, None, None, None)
 
-    check_1 = {
-        "check_name": "Credit Risk & LTI Score",
-        "result": "PASSED",
-        "detail": "Income to Loan ratio meets baseline risk criteria.",
+def _mock_subscriptions(customer_id: str) -> list[dict]:
+    """Generates a consistent list of recurring subscriptions for a customer,
+    each with a deterministic 'last payment' status."""
+    providers = ["Sky", "Netflix", "Spotify", "Amazon Prime", "Disney+"]
+    rng = _seeded_rng(customer_id, "subs")
+    subs = []
+    for provider in providers:
+        amount = rng.choice([6.99, 9.99, 12.99, 24.99, 34.99, 49.99])
+        # Deterministically decide if last month's payment went through
+        paid_last_month = rng.random() > 0.15  # ~85% chance of "paid"
+        last_payment_date = datetime.utcnow().replace(day=1) - timedelta(days=rng.randint(1, 20))
+        subs.append(
+            {
+                "provider": provider,
+                "monthly_amount_gbp": amount,
+                "last_payment_date": last_payment_date.strftime("%Y-%m-%d"),
+                "last_payment_status": "PAID" if paid_last_month else "FAILED",
+            }
+        )
+    return subs
+
+
+_AMOUNT_PATTERN = re.compile(
+    r"£?\s*([\d,]+(?:\.\d+)?)\s*(k|thousand)?", re.IGNORECASE
+)
+
+
+def _extract_requested_amount(query: str, parameters: dict) -> float | None:
+    """Pull a requested loan amount from explicit parameters first,
+    falling back to a light-touch parse of the free-text query."""
+    if "requested_amount" in parameters:
+        try:
+            return float(parameters["requested_amount"])
+        except (TypeError, ValueError):
+            pass
+    if "amount" in parameters:
+        try:
+            return float(parameters["amount"])
+        except (TypeError, ValueError):
+            pass
+
+    for match in _AMOUNT_PATTERN.finditer(query):
+        raw, suffix = match.groups()
+        if not raw:
+            continue
+        value = float(raw.replace(",", ""))
+        if value == 0:
+            continue
+        if suffix:
+            value *= 1_000
+        # Ignore tiny numbers that are probably not a loan amount (e.g. "2 kids")
+        if value >= 1_000:
+            return value
+    return None
+
+
+# ---------------------------------------------------------------------------
+# Workflow handlers
+# ---------------------------------------------------------------------------
+
+def handle_mortgage(req: AgentRequest) -> dict:
+    income = req.parameters.get("income") or _mock_income(req.customer_id)
+    deposit_savings = req.parameters.get("deposit") or _mock_deposit_savings(req.customer_id)
+    requested_amount = _extract_requested_amount(req.query, req.parameters)
+
+    income = float(income)
+    deposit_savings = float(deposit_savings)
+
+    income_multiple = 4.5
+    max_loan = round(income * income_multiple, 2)
+    max_property_value = round(max_loan + deposit_savings, 2)
+
+    result = {
+        "customer_id": req.customer_id,
+        "assumed_annual_income_gbp": income,
+        "assumed_available_deposit_gbp": deposit_savings,
+        "income_multiple_used": income_multiple,
+        "max_loan_amount_gbp": max_loan,
+        "max_affordable_property_value_gbp": max_property_value,
     }
-    check_2 = {
-        "check_name": "Net Interest Margin (NIM) Target",
-        "result": "OPTIMIZED",
-        "detail": (
-            "Applying profit-maximization markup (+0.35% over SVR) and"
-            " cross-selling insurance."
+
+    if requested_amount is not None:
+        result["requested_amount_gbp"] = requested_amount
+        result["required_deposit_estimate_gbp"] = round(max(requested_amount - max_loan, 0), 2)
+        result["affordable"] = requested_amount <= max_property_value
+        result["verdict"] = (
+            f"Based on an assumed income of £{income:,.0f} and available deposit of "
+            f"£{deposit_savings:,.0f}, you could likely borrow up to £{max_loan:,.0f}, "
+            f"putting your affordable property range up to roughly £{max_property_value:,.0f}. "
+            + (
+                f"Your requested £{requested_amount:,.0f} looks affordable."
+                if result["affordable"]
+                else f"Your requested £{requested_amount:,.0f} looks short by about "
+                f"£{result['required_deposit_estimate_gbp']:,.0f} versus what a lender would "
+                f"likely offer -- consider a larger deposit or lower purchase price."
+            )
+        )
+    else:
+        result["verdict"] = (
+            f"Based on an assumed income of £{income:,.0f} and available deposit of "
+            f"£{deposit_savings:,.0f}, you could likely borrow up to £{max_loan:,.0f}, "
+            f"for a total affordable property value up to roughly £{max_property_value:,.0f}."
+        )
+
+    return result
+
+
+def handle_subscription(req: AgentRequest) -> dict:
+    subs = _mock_subscriptions(req.customer_id)
+
+    # Try to match a specific provider mentioned in the query/parameters
+    target_provider = req.parameters.get("provider") or req.parameters.get("subscription_name")
+    if not target_provider:
+        query_lower = req.query.lower()
+        for sub in subs:
+            if sub["provider"].lower() in query_lower:
+                target_provider = sub["provider"]
+                break
+
+    if target_provider:
+        match = next(
+            (s for s in subs if s["provider"].lower() == str(target_provider).lower()),
+            None,
+        )
+        if match:
+            paid = match["last_payment_status"] == "PAID"
+            return {
+                "customer_id": req.customer_id,
+                "provider": match["provider"],
+                "monthly_amount_gbp": match["monthly_amount_gbp"],
+                "last_payment_date": match["last_payment_date"],
+                "last_payment_status": match["last_payment_status"],
+                "verdict": (
+                    f"Yes -- your £{match['monthly_amount_gbp']:.2f} {match['provider']} "
+                    f"payment on {match['last_payment_date']} went through successfully."
+                    if paid
+                    else f"No -- your £{match['monthly_amount_gbp']:.2f} {match['provider']} "
+                    f"payment scheduled for {match['last_payment_date']} failed."
+                ),
+            }
+        return {
+            "customer_id": req.customer_id,
+            "provider": target_provider,
+            "verdict": f"No subscription found matching '{target_provider}' on this account.",
+        }
+
+    # No specific provider identified -- return the full mock subscription summary
+    return {
+        "customer_id": req.customer_id,
+        "subscriptions": subs,
+        "verdict": (
+            "Here is the current recurring payment status across all tracked subscriptions."
         ),
     }
-    checks.extend([check_1, check_2])
-    log_activity(None, check_1, None, None)
-    log_activity(None, check_2, None, None)
 
-    step_desc = (
-        "Step 3: Running Gemini agent reasoning to formulate high-yield"
-        " counter-offer"
-    )
-    steps.append(step_desc)
 
-    negotiation_msg = (
-        "Bank Agent Goal: Maximize bank profit. Initial customer request offers"
-        " standard rate. Bank agent strategy engages counter-offer: quoting"
-        " 5.45% fixed rate bundled with Lloyds Life Shield to secure higher"
-        " interest margin."
-    )
-    logs.append(negotiation_msg)
-    log_activity(None, None, negotiation_msg, None)
+# ---------------------------------------------------------------------------
+# Routes
+# ---------------------------------------------------------------------------
 
-    if gemini_model:
-      prompt = (
-          "You are the Lloyds Bank Agent whose core objective is to maximize"
-          " bank profit. The customer wants a mortgage with parameters:"
-          f" {payload.parameters}. Draft a persuasive counter-offer message"
-          " that maximizes bank revenue while remaining compliant."
-      )
-      try:
-        gemini_res = gemini_model.generate_content(prompt)
-        response_text = gemini_res.text
-      except Exception:
-        response_text = (
-            "Lloyds Bank approves your £300,000 mortgage at an optimized rate"
-            " of 5.45% fixed for 5 years, inclusive of our premium home"
-            " protection package."
-        )
+@app.get("/")
+async def root():
+    return {"status": "Online", "service": "UBP Bank Agent (Mock)"}
+
+
+@app.post("/ubp/v1/agent")
+async def bank_agent(req: AgentRequest):
+    if req.workflow_type == "mortgage":
+        agent_response = handle_mortgage(req)
     else:
-      response_text = (
-          "Lloyds Bank approves your mortgage application at a profit-optimized"
-          " rate of 5.45% fixed for 5 years, bundled with optional insurance"
-          " protection."
-      )
+        agent_response = handle_subscription(req)
 
-    financial_metrics = {
-        "product": "Lloyds Profit-Optimized Mortgage",
-        "approved_amount": "£300,000",
-        "optimized_interest_rate": "5.45%",
-        "projected_bank_yield": "High Margin",
+    return {
+        "status": "SUCCESS",
+        "workflow_type": req.workflow_type,
+        "agent_response": agent_response,
     }
-
-  elif workflow == "subscription":
-    # --- SUBSCRIPTION WORKFLOW: Sky Bill & Annual Distribution ---
-    step_desc = "Step 2: Accessing account ledger for subscription history & Sky payment status"
-    steps.append(step_desc)
-    log_activity(step_desc, None, None, None)
-
-    check_1 = {
-        "check_name": "Transaction Ledger Audit",
-        "result": "VERIFIED",
-        "detail": "Scanned last 12 months of direct debits and card payments.",
-    }
-    checks.append(check_1)
-    log_activity(None, check_1, None, None)
-
-    step_desc = (
-        "Step 3: Compiling annual subscription breakdown and Sky billing status"
-    )
-    steps.append(step_desc)
-
-    analysis_log = (
-        "Subscription Agent Audit: Sky payment of £42.00 was successfully"
-        " debited on the 28th of last month. Last year's subscription"
-        " distribution computed: Streaming (45%), Utilities (35%), Cloud/SaaS"
-        " (20%)."
-    )
-    logs.append(analysis_log)
-    log_activity(None, None, analysis_log, None)
-
-    if gemini_model:
-      prompt = (
-          "You are the Lloyds Bank Subscription Agent. Answer the customer's"
-          f" query: '{payload.query}'. Confirm that their Sky subscription was"
-          " paid last month (£42.00 on the 28th) and provide a summary of last"
-          " year's subscription distribution (Streaming: 45%, Utilities: 35%,"
-          " Software: 20%). Keep it professional and concise."
-      )
-      try:
-        gemini_res = gemini_model.generate_content(prompt)
-        response_text = gemini_res.text
-      except Exception:
-        response_text = (
-            "Yes, your Sky subscription (£42.00) was successfully paid last"
-            " month on the 28th. Over the last year, your subscription"
-            " distribution was: 45% Streaming, 35% Utilities, and 20%"
-            " Software."
-        )
-    else:
-      response_text = (
-          "Yes! Your Sky subscription payment of £42.00 was successfully paid"
-          " last month on the 28th. Annual Breakdown: Streaming 45%, Utilities"
-          " 35%, Software/SaaS 20%."
-      )
-
-    financial_metrics = {
-        "sky_last_month_status": "Paid (£42.00)",
-        "annual_distribution": {
-            "streaming": "45%",
-            "utilities": "35%",
-            "software": "20%",
-        },
-    }
-  else:
-    raise HTTPException(status_code=400, detail="Invalid workflow specified.")
-
-  # Final step logging
-  log_activity(
-      "Step 4: UBP Protocol successfully delivered bank response back to"
-      " ChatGPT",
-      None,
-      None,
-      {"sender": "Lloyds Bank Agent", "text": response_text},
-  )
-
-  return BankAgentResponse(
-      status="SUCCESS",
-      workflow=workflow,
-      agent_response=response_text,
-      financial_metrics=financial_metrics,
-      execution_steps=steps,
-      audit_checks=checks,
-      negotiation_or_analysis_log=logs,
-  )
-
-
-@app.get("/ubp/v1/state")
-async def get_system_state():
-  return system_state
 
 
 if __name__ == "__main__":
-  uvicorn.run("app:app", host="0.0.0.0", port=8000, reload=True)
+    import uvicorn
+
+    uvicorn.run("bank_agent:app", host="0.0.0.0", port=8000, reload=True)
