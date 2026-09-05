@@ -1,5 +1,6 @@
 fastapi
 uvicorn
 pydantic
+google-generativeai
 httpx
-mcp[cli]
+mcp<2.0.0
