@@ -2,16 +2,14 @@ from datetime import datetime
 import httpx
 from fastapi import FastAPI, HTTPException, status
 from fastapi.middleware.cors import CORSMiddleware
-from mcp.server.fastmcp import FastMCP
 from pydantic import BaseModel, Field
 
-# Initialize FastAPI app
 app = FastAPI(
-    title="Universal Banking Protocol (UBP) MCP Gateway",
-    version="3.0.0",
+    title="Universal Banking Protocol (UBP) Gateway",
+    version="3.1.0",
     description=(
-        "Model Context Protocol (MCP) Server and Gateway routing requests to"
-        " Lloyds Bank Agent."
+        "Universal Banking Protocol (UBP) Gateway routing requests to Lloyds"
+        " Bank Agent."
     ),
 )
 
@@ -26,51 +24,85 @@ app.add_middleware(
 # Target deployed Bank Agent URL
 BANK_AGENT_URL = "https://ubp-bank-agent.onrender.com/ubp/v1/agent"
 
-# Initialize FastMCP server instance
-mcp = FastMCP("Lloyds-Bank-UBP-Server")
+
+class UserQueryPayload(BaseModel):
+  customer_id: str = Field(
+      ..., description="Unique customer identifier from the AI platform"
+  )
+  workflow_type: str = Field(
+      ..., description="Either 'mortgage' or 'subscription'"
+  )
+  query: str = Field(..., description="The original natural language prompt")
+  parameters: dict = Field(
+      default={}, description="Extracted parameters like income, deposit, etc."
+  )
 
 
-# Define the MCP Tool wrapper that ChatGPT / Claude can discover and execute
-@mcp.tool()
-async def lloyds_bank_workflow(
-    customer_id: str,
-    workflow_type: str,
-    query: str,
-    parameters: dict = {},
-) -> str:
-  """Executes a Lloyds Bank workflow (Mortgage profit-maximization or Subscription ledger/Sky check)
+@app.get("/")
+async def root():
+  return {
+      "status": "Online",
+      "service": "UBP Gateway",
+      "target_agent": BANK_AGENT_URL,
+  }
 
-  via the Universal Banking Protocol (UBP).
+
+@app.post(
+    "/ubp/v1/tunnel/dispatch",
+    operation_id="dispatch_ubp_banking_request",
+    summary="Dispatch request via UBP tunnel to Bank Agent",
+)
+async def dispatch_to_bank(payload: UserQueryPayload):
+  """Receives requests from AI plugins, wraps them in UBP envelopes, and
+
+  proxies them directly to the bank agent backend.
   """
-  payload = {
-      "customer_id": customer_id,
-      "workflow_type": workflow_type,
-      "query": query,
-      "parameters": parameters,
+  ubp_envelope = {
+      "ubp_version": "2.0-secure",
+      "timestamp": datetime.utcnow().isoformat(),
+      "origin_client": "AI-Assistant-Plugin (ChatGPT/Claude)",
+      "payload": {
+          "customer_id": payload.customer_id,
+          "workflow_type": payload.workflow_type,
+          "query": payload.query,
+          "parameters": payload.parameters,
+      },
   }
 
   async with httpx.AsyncClient() as client:
     try:
-      response = await client.post(BANK_AGENT_URL, json=payload, timeout=30.0)
-      if response.status_code != 200:
-        return f"Error from Bank Agent: {response.text}"
+      bank_response = await client.post(
+          BANK_AGENT_URL, json=ubp_envelope["payload"], timeout=25.0
+      )
 
-      data = response.json()
-      return str(data.get("agent_response", data))
-    except Exception as e:
-      return f"MCP Gateway Connection Error: {str(e)}"
+      if bank_response.status_code != 200:
+        raise HTTPException(
+            status_code=bank_response.status_code,
+            detail=(
+                "Bank Agent rejected UBP packet:"
+                f" {bank_response.text}"
+            ),
+        )
 
+      bank_data = bank_response.json()
 
-# Mount the FastMCP SSE application handlers directly onto FastAPI
-from starlette.applications import Starlette
-from starlette.routing import Mount
+    except httpx.RequestError as exc:
+      raise HTTPException(
+          status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+          detail=(
+              "UBP Tunnel Error: Could not reach Bank Agent backend"
+              f" ({str(exc)})"
+          ),
+      )
 
-# Get the native MCP SSE app and mount it
-mcp_app = mcp._sse_app()
-app.mount("/", mcp_app)
+  return {
+      "status": "SUCCESS",
+      "protocol": "UBP/2.0",
+      "bank_agent_response": bank_data,
+  }
 
 
 if __name__ == "__main__":
   import uvicorn
 
-  uvicorn.run("ubp:app", host="0.0.0.0", port=8000, reload=True)
+  uvicorn.run("ub:app", host="0.0.0.0", port=8000, reload=True)
