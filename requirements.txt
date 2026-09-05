@@ -2,4 +2,4 @@ fastapi
 uvicorn
 pydantic
 httpx
-mcp<2.0.0
+mcp>=1.28.0,<2.0.0
