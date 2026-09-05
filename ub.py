@@ -1,14 +1,19 @@
 import contextlib
+
 import httpx
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 from mcp.server.fastmcp import FastMCP
+from mcp.server.transport_security import TransportSecuritySettings
 
+# Target deployed Bank Agent URL
 BANK_AGENT_URL = "https://ubp-bank-agent.onrender.com/ubp/v1/agent"
 
-# Initialize FastMCP Server (unchanged)
+# Initialize FastMCP Server
 mcp = FastMCP("Lloyds-Bank-UBP-Gateway")
 
+
+# Define the tool that MCP clients (ChatGPT / Claude) can natively discover & call
 @mcp.tool()
 async def lloyds_bank_workflow(
     customer_id: str,
@@ -35,21 +40,34 @@ async def lloyds_bank_workflow(
         except Exception as e:
             return f"MCP Gateway Connection Error: {str(e)}"
 
-# Build the Streamable HTTP ASGI app (NOT sse_app)
-mcp_asgi_app = mcp.streamable_http_app()
+
+# Build the Streamable HTTP ASGI app (replaces the old sse_app()).
+# transport_security allowlists the real production Host header --
+# without this, every request gets rejected with 421 "Invalid Host header"
+# because the SDK's DNS-rebinding protection defaults to localhost-only.
+mcp_asgi_app = mcp.streamable_http_app(
+    transport_security=TransportSecuritySettings(
+        allowed_hosts=["ubp-gateway.onrender.com"],
+        allowed_origins=["https://ubp-gateway.onrender.com"],
+    )
+)
+
 
 # FastAPI does NOT auto-run a mounted sub-app's lifespan.
-# Without this, the session manager's task group never starts.
+# Without this, the MCP session manager's task group never starts,
+# and every request fails with "Task group is not initialized."
 @contextlib.asynccontextmanager
 async def lifespan(app: FastAPI):
     async with mcp.session_manager.run():
         yield
 
+
+# Initialize FastAPI app for standard web endpoints and UI
 app = FastAPI(
     title="Universal Banking Protocol (UBP) MCP Gateway",
     version="4.1.0",
     description="Streamable HTTP MCP Server routing requests to Lloyds Bank Agent.",
-    lifespan=lifespan,   # <-- critical
+    lifespan=lifespan,
 )
 
 app.add_middleware(
@@ -60,6 +78,7 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
+
 @app.get("/")
 async def root():
     return {
@@ -68,6 +87,13 @@ async def root():
         "target_agent": BANK_AGENT_URL,
     }
 
+
 # FastMCP's streamable_http_app() internally serves at /mcp,
 # so mounting at "/" exposes it at https://your-host/mcp
 app.mount("/", mcp_asgi_app)
+
+
+if __name__ == "__main__":
+    import uvicorn
+
+    uvicorn.run("ub:app", host="0.0.0.0", port=8000, reload=True)
