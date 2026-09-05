@@ -1,22 +1,25 @@
 """
-UBP Bank Agent -- Mortgage Journey, Auto-Classified, with Live Dashboard
-=========================================================================
-Single entrypoint: POST /ubp/v1/agent
-  Request:  { "customer_id": "1", "query": "<natural language from ChatGPT>", "parameters": {} }
-  - customer_id defaults to "1" if omitted/blank.
-  - workflow_type is NOT required from the caller -- the bank agent classifies
-    it itself from the query text (mortgage vs subscription).
-  - Every call appends to a per-customer audit trail: conversation, risk
-    checks performed, negotiation rounds, and step/status tracker.
-
-Dashboard: GET /ui  -- self-contained HTML+JS, polls the state endpoint and
-renders 4 panels: (1) conversation, (2) checks performed, (3) negotiation
-workflow, (4) steps completed.
+UBP Bank Agent -- Mortgage Journey, Size-Capped SQLite, Live Dashboard
+========================================================================
+Persists state to SQLite (survives restarts within the same instance).
+Two safeguards for a 512MB RAM environment:
+  1. Per-customer record: conversation/checks/negotiation lists are
+     trimmed to a max length so a single long-running chat can't grow
+     one row unbounded.
+  2. Whole DB file: after every save, if bank_agent.db exceeds
+     MAX_DB_SIZE_BYTES (50MB), the oldest customer records (by
+     updated_at) are deleted until the file is back under
+     TARGET_DB_SIZE_BYTES (40MB), then VACUUM reclaims the freed disk
+     space (SQLite doesn't shrink the file on DELETE alone).
 """
 
 import hashlib
+import json
+import os
 import random
 import re
+import sqlite3
+from contextlib import contextmanager
 from datetime import date, datetime
 from typing import Literal, Optional
 
@@ -25,10 +28,7 @@ from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import HTMLResponse
 from pydantic import BaseModel, Field
 
-app = FastAPI(
-    title="UBP Bank Agent -- Auto-Classified Mortgage Journey",
-    version="3.0.0",
-)
+app = FastAPI(title="UBP Bank Agent -- Auto-Classified Mortgage Journey", version="3.2.0")
 
 app.add_middleware(
     CORSMiddleware,
@@ -38,9 +38,122 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
+DB_PATH = "bank_agent.db"
+
+# --- Size caps for 512MB RAM environment ---
+MAX_DB_SIZE_BYTES = 50 * 1024 * 1024       # 50 MB hard ceiling
+TARGET_DB_SIZE_BYTES = 40 * 1024 * 1024    # prune down to 40 MB when exceeded
+MAX_CONVERSATION_ENTRIES = 100             # per customer
+MAX_CHECK_ENTRIES = 60                     # per customer
+MAX_NEGOTIATION_ENTRIES = 40               # per customer
+
 
 # ============================================================================
-# 1. CUSTOMER DATA MODEL -- 20 known-to-bank + 10 customer-supplied = 30
+# SQLITE STORAGE LAYER (with size-cap enforcement)
+# ============================================================================
+
+def _init_db():
+    with _connect() as conn:
+        conn.execute(
+            """
+            CREATE TABLE IF NOT EXISTS customer_state (
+                customer_id TEXT PRIMARY KEY,
+                state_json TEXT NOT NULL,
+                updated_at TEXT NOT NULL
+            )
+            """
+        )
+        conn.execute(
+            "CREATE INDEX IF NOT EXISTS idx_customer_state_updated_at ON customer_state (updated_at)"
+        )
+        conn.commit()
+
+
+@contextmanager
+def _connect():
+    conn = sqlite3.connect(DB_PATH, timeout=10)
+    conn.execute("PRAGMA journal_mode=WAL;")
+    try:
+        yield conn
+    finally:
+        conn.close()
+
+
+def _load_state(customer_id: str) -> Optional[dict]:
+    with _connect() as conn:
+        row = conn.execute(
+            "SELECT state_json FROM customer_state WHERE customer_id = ?", (customer_id,)
+        ).fetchone()
+        if row is None:
+            return None
+        return json.loads(row[0])
+
+
+def _trim_state_lists(state: dict) -> dict:
+    """Keep only the most recent N entries per list so a single
+    long-running conversation can't grow one row unbounded."""
+    state["conversation"] = state["conversation"][-MAX_CONVERSATION_ENTRIES:]
+    state["checks"] = state["checks"][-MAX_CHECK_ENTRIES:]
+    state["negotiation"] = state["negotiation"][-MAX_NEGOTIATION_ENTRIES:]
+    return state
+
+
+def _save_state(customer_id: str, state: dict):
+    state = _trim_state_lists(state)
+    payload = json.dumps(state, default=str)
+    with _connect() as conn:
+        conn.execute(
+            """
+            INSERT INTO customer_state (customer_id, state_json, updated_at)
+            VALUES (?, ?, ?)
+            ON CONFLICT(customer_id) DO UPDATE SET state_json = excluded.state_json, updated_at = excluded.updated_at
+            """,
+            (customer_id, payload, datetime.utcnow().isoformat()),
+        )
+        conn.commit()
+    _enforce_db_size_cap()
+
+
+def _current_db_size_bytes() -> int:
+    try:
+        return os.path.getsize(DB_PATH)
+    except OSError:
+        return 0
+
+
+def _enforce_db_size_cap():
+    """If the DB file exceeds MAX_DB_SIZE_BYTES, delete the oldest
+    customer records (by updated_at) until back under
+    TARGET_DB_SIZE_BYTES, then VACUUM to actually shrink the file on
+    disk (SQLite doesn't reclaim space from DELETE alone)."""
+    size = _current_db_size_bytes()
+    if size <= MAX_DB_SIZE_BYTES:
+        return
+
+    with _connect() as conn:
+        deleted_any = False
+        while _current_db_size_bytes() > TARGET_DB_SIZE_BYTES:
+            row = conn.execute(
+                "SELECT customer_id FROM customer_state ORDER BY updated_at ASC LIMIT 1"
+            ).fetchone()
+            if row is None:
+                break  # nothing left to delete
+            conn.execute("DELETE FROM customer_state WHERE customer_id = ?", (row[0],))
+            conn.commit()
+            deleted_any = True
+            # VACUUM is what actually shrinks the file -- check size fresh each loop
+            conn.execute("VACUUM")
+            conn.commit()
+
+        if not deleted_any:
+            return
+
+
+_init_db()
+
+
+# ============================================================================
+# 1. CUSTOMER DATA MODEL
 # ============================================================================
 
 class KnownToBank(BaseModel):
@@ -73,10 +186,10 @@ FIELD_METADATA: dict[str, dict] = {
     "deposit_available": {"required": True, "question": "How much deposit do you have available?"},
     "requested_mortgage_term_years": {"required": True, "question": "Over how many years would you like the mortgage term (e.g. 25, 30)?"},
     "is_first_time_buyer": {"required": True, "question": "Are you a first-time buyer?"},
-    "property_type": {"required": False, "question": "What type of property is it (flat, terraced, semi-detached, detached, new build)?"},
-    "deposit_source": {"required": False, "question": "What is the source of your deposit (savings, gift, inheritance, property sale)?"},
+    "property_type": {"required": False, "question": "What type of property is it?"},
+    "deposit_source": {"required": False, "question": "What is the source of your deposit?"},
     "number_of_dependents": {"required": False, "question": "How many dependents do you have?"},
-    "other_income_sources": {"required": False, "question": "Do you have any other annual income not held with this bank?"},
+    "other_income_sources": {"required": False, "question": "Any other annual income not held with this bank?"},
     "other_outstanding_debts_elsewhere": {"required": False, "question": "Any outstanding loans/credit cards with OTHER lenders?"},
 }
 
@@ -86,7 +199,7 @@ def _seeded_rng(customer_id: str, salt: str = "") -> random.Random:
     return random.Random(seed)
 
 
-def _generate_known_profile(customer_id: str) -> KnownToBank:
+def _generate_known_profile(customer_id: str) -> dict:
     rng = _seeded_rng(customer_id, "known")
     gross_income = rng.randrange(28_000, 95_000, 1_000)
     net_income = round(gross_income * rng.uniform(0.68, 0.78), 2)
@@ -113,7 +226,7 @@ def _generate_known_profile(customer_id: str) -> KnownToBank:
         years_as_bank_customer=round(rng.uniform(0.5, 20), 1),
         marital_status=rng.choice(["single", "married", "married", "civil_partnership", "divorced"]),
         current_address_years=round(rng.uniform(0.5, 10), 1),
-    )
+    ).model_dump()
 
 
 def _mock_subscriptions(customer_id: str) -> list[dict]:
@@ -123,25 +236,21 @@ def _mock_subscriptions(customer_id: str) -> list[dict]:
     for provider in providers:
         amount = rng.choice([6.99, 9.99, 12.99, 24.99, 34.99, 49.99])
         paid = rng.random() > 0.15
-        subs.append({
-            "provider": provider,
-            "monthly_amount_gbp": amount,
-            "last_payment_status": "PAID" if paid else "FAILED",
-        })
+        subs.append({"provider": provider, "monthly_amount_gbp": amount, "last_payment_status": "PAID" if paid else "FAILED"})
     return subs
 
 
 # ============================================================================
-# 2. PER-CUSTOMER STATE -- conversation / checks / negotiation / steps
+# 2. PER-CUSTOMER STATE
 # ============================================================================
 
-_CUSTOMER_DB: dict[str, dict] = {}
 STEP_NAMES = ["Requirements gathering", "Risk checks", "Negotiation", "Decision"]
 
 
 def _get_customer(customer_id: str) -> dict:
-    if customer_id not in _CUSTOMER_DB:
-        _CUSTOMER_DB[customer_id] = {
+    state = _load_state(customer_id)
+    if state is None:
+        state = {
             "known": _generate_known_profile(customer_id),
             "supplied": {},
             "conversation": [],
@@ -151,13 +260,12 @@ def _get_customer(customer_id: str) -> dict:
             "workflow_type": None,
             "final_decision": None,
         }
-    return _CUSTOMER_DB[customer_id]
+        _save_state(customer_id, state)
+    return state
 
 
 def _log(state: dict, role: str, message: str):
-    state["conversation"].append({
-        "role": role, "message": message, "timestamp": datetime.utcnow().isoformat(),
-    })
+    state["conversation"].append({"role": role, "message": message, "timestamp": datetime.utcnow().isoformat()})
 
 
 def _check(state: dict, name: str, passed: bool, detail: str):
@@ -171,7 +279,7 @@ def _set_step(state: dict, step_name: str, status: str):
 
 
 # ============================================================================
-# 3. WORKFLOW CLASSIFICATION -- bank agent decides, caller doesn't specify
+# 3. WORKFLOW CLASSIFICATION
 # ============================================================================
 
 MORTGAGE_KEYWORDS = ["mortgage", "home", "house", "property", "buy", "borrow", "loan", "deposit", "flat"]
@@ -211,7 +319,7 @@ def _extract_amount(query: str, key_hints: list[str], parameters: dict) -> Optio
 # 4. PRICING ENGINE
 # ============================================================================
 
-def _compute_fair_rate(known: KnownToBank, supplied: dict, ltv_percent: float, state: dict) -> float:
+def _compute_fair_rate(known: dict, supplied: dict, ltv_percent: float, state: dict) -> float:
     rate = 4.20
     if ltv_percent > 85:
         rate += 0.55
@@ -222,7 +330,7 @@ def _compute_fair_rate(known: KnownToBank, supplied: dict, ltv_percent: float, s
     else:
         _check(state, "LTV check", True, f"{ltv_percent:.1f}% LTV is low risk -- no loading")
 
-    cs = known.credit_score
+    cs = known["credit_score"]
     if cs < 650:
         rate += 0.50
         _check(state, "Credit score check", False, f"Score {cs} is below preferred threshold -- rate loaded +0.50%")
@@ -233,14 +341,14 @@ def _compute_fair_rate(known: KnownToBank, supplied: dict, ltv_percent: float, s
         rate -= 0.10
         _check(state, "Credit score check", True, f"Score {cs} is excellent -- discount -0.10%")
 
-    if known.employment_status in ("self_employed", "contract"):
+    if known["employment_status"] in ("self_employed", "contract"):
         rate += 0.20
-        _check(state, "Employment stability check", False, f"{known.employment_status} status -- rate loaded +0.20%")
+        _check(state, "Employment stability check", False, f"{known['employment_status']} status -- rate loaded +0.20%")
     else:
         _check(state, "Employment stability check", True, "Salaried employment -- no loading")
 
-    monthly_debt = known.existing_debts_with_bank_monthly_payment + (supplied.get("other_outstanding_debts_elsewhere") or 0) / 24
-    annual_income = known.annual_gross_income + (supplied.get("other_income_sources") or 0)
+    monthly_debt = known["existing_debts_with_bank_monthly_payment"] + (supplied.get("other_outstanding_debts_elsewhere") or 0) / 24
+    annual_income = known["annual_gross_income"] + (supplied.get("other_income_sources") or 0)
     dti = (monthly_debt * 12) / annual_income if annual_income else 1.0
     if dti > 0.35:
         rate += 0.30
@@ -265,10 +373,7 @@ ANCHOR_MARGIN = 0.45
 FLOOR_MARGIN = 0.05
 
 
-def _run_negotiation(state: dict, known: KnownToBank, supplied: dict, loan_amount: float, term_years: int, ltv_percent: float) -> dict:
-    """Auto-simulates the back-and-forth in one call: bank anchors high,
-    a simulated customer-profit-maximizing agent counters low, bank concedes
-    gradually toward its floor. Every round is logged for the UI."""
+def _run_negotiation(state: dict, known: dict, supplied: dict, loan_amount: float, term_years: int, ltv_percent: float) -> dict:
     fair_rate = _compute_fair_rate(known, supplied, ltv_percent, state)
     anchor = round(fair_rate + ANCHOR_MARGIN, 2)
     floor = round(fair_rate + FLOOR_MARGIN, 2)
@@ -277,7 +382,7 @@ def _run_negotiation(state: dict, known: KnownToBank, supplied: dict, loan_amoun
     _log(state, "bank_agent", f"Opening offer: {anchor}% APR.")
 
     current = anchor
-    customer_ask = floor  # simulated customer agent always pushes toward the floor
+    customer_ask = floor
     concession_schedule = {1: 0.20, 2: 0.45, 3: 0.70}
 
     for rnd in range(1, MAX_ROUNDS):
@@ -307,15 +412,20 @@ def _run_negotiation(state: dict, known: KnownToBank, supplied: dict, loan_amoun
 # ============================================================================
 
 class AgentRequest(BaseModel):
-    customer_id: str = Field(default="1", description="Customer identifier -- defaults to '1' if not supplied")
-    workflow_type: Optional[str] = Field(default=None, description="Ignored -- bank agent classifies this itself from the query")
-    query: str = Field(..., description="Natural language message, as sent by the AI assistant")
+    customer_id: str = Field(default="1")
+    workflow_type: Optional[str] = Field(default=None, description="Ignored -- classified from query")
+    query: str
     parameters: dict = Field(default_factory=dict)
 
 
 @app.get("/")
 async def root():
-    return {"status": "Online", "service": "UBP Bank Agent -- Auto-Classified Mortgage Journey"}
+    return {
+        "status": "Online",
+        "service": "UBP Bank Agent -- SQLite Persisted, Size-Capped",
+        "db_size_bytes": _current_db_size_bytes(),
+        "db_size_cap_bytes": MAX_DB_SIZE_BYTES,
+    }
 
 
 @app.post("/ubp/v1/agent")
@@ -357,17 +467,17 @@ async def bank_agent(req: AgentRequest):
                 answer = f"No subscription found matching '{target}'."
         else:
             answer = "Here is your full recurring payment summary."
-            state["_subs_snapshot"] = subs
 
         _set_step(state, "Decision", "done")
         _log(state, "bank_agent", answer)
-        state["final_decision"] = {"answer": answer, "subscriptions": subs if not target else None}
+        state["final_decision"] = {"answer": answer}
+        _save_state(customer_id, state)
         return {"status": "SUCCESS", "workflow_type": workflow_type, "agent_response": {"verdict": answer, "subscriptions": subs}}
 
     # --- mortgage workflow ---
     supplied = state["supplied"]
     supplied.update({k: v for k, v in req.parameters.items() if v is not None})
-    if "requested_loan_amount" not in supplied or supplied.get("requested_loan_amount") is None:
+    if supplied.get("requested_loan_amount") is None:
         amt = _extract_amount(req.query, ["requested_loan_amount", "amount"], req.parameters)
         if amt:
             supplied["requested_loan_amount"] = amt
@@ -379,11 +489,8 @@ async def bank_agent(req: AgentRequest):
         questions = [FIELD_METADATA[f]["question"] for f in missing_required]
         answer = "Before I can proceed, I need a bit more information: " + " ".join(questions)
         _log(state, "bank_agent", answer)
-        return {
-            "status": "NEEDS_INFO",
-            "workflow_type": workflow_type,
-            "agent_response": {"verdict": answer, "missing_fields": missing_required},
-        }
+        _save_state(customer_id, state)
+        return {"status": "NEEDS_INFO", "workflow_type": workflow_type, "agent_response": {"verdict": answer, "missing_fields": missing_required}}
 
     _set_step(state, "Requirements gathering", "done")
     _set_step(state, "Risk checks", "in_progress")
@@ -401,6 +508,7 @@ async def bank_agent(req: AgentRequest):
         _set_step(state, "Decision", "done")
         answer = f"Requested loan implies {ltv_percent:.1f}% LTV, which exceeds our 90% maximum. A larger deposit is needed."
         _log(state, "bank_agent", answer)
+        _save_state(customer_id, state)
         return {"status": "REJECTED", "workflow_type": workflow_type, "agent_response": {"verdict": answer}}
 
     _set_step(state, "Risk checks", "done")
@@ -415,6 +523,7 @@ async def bank_agent(req: AgentRequest):
     )
     _log(state, "bank_agent", answer)
     state["final_decision"] = {"rate": result["final_rate"], "monthly_repayment": result["monthly_repayment"]}
+    _save_state(customer_id, state)
     return {
         "status": "SUCCESS",
         "workflow_type": workflow_type,
@@ -431,9 +540,9 @@ async def bank_agent(req: AgentRequest):
 
 @app.get("/ubp/v1/agent/state/{customer_id}")
 async def get_state(customer_id: str):
-    if customer_id not in _CUSTOMER_DB:
+    state = _load_state(customer_id)
+    if state is None:
         raise HTTPException(status_code=404, detail="No state yet for this customer_id")
-    state = _CUSTOMER_DB[customer_id]
     return {
         "customer_id": customer_id,
         "workflow_type": state["workflow_type"],
@@ -445,8 +554,21 @@ async def get_state(customer_id: str):
     }
 
 
+@app.get("/ubp/v1/agent/db-stats")
+async def db_stats():
+    """Quick way to check current DB footprint against the 50MB cap."""
+    with _connect() as conn:
+        count = conn.execute("SELECT COUNT(*) FROM customer_state").fetchone()[0]
+    return {
+        "db_size_bytes": _current_db_size_bytes(),
+        "db_size_mb": round(_current_db_size_bytes() / (1024 * 1024), 2),
+        "cap_mb": round(MAX_DB_SIZE_BYTES / (1024 * 1024), 2),
+        "customer_records": count,
+    }
+
+
 # ============================================================================
-# 6. DASHBOARD UI -- 4 panels, polls the state endpoint
+# 6. DASHBOARD UI
 # ============================================================================
 
 DASHBOARD_HTML = """
@@ -488,6 +610,7 @@ DASHBOARD_HTML = """
   .step .status { font-size:11px; color:var(--muted); margin-left:auto; text-transform:capitalize; }
   .empty { color:var(--muted); font-size:13px; }
   .verdict { margin-top:12px; padding:10px; background:#1a2e22; border:1px solid #2a4a36; border-radius:8px; font-size:13px; }
+  footer { padding:8px 24px; font-size:11px; color:var(--muted); }
 </style>
 </head>
 <body>
@@ -497,36 +620,31 @@ DASHBOARD_HTML = """
     <button onclick="load()">Refresh</button>
   </header>
   <div class="grid">
-    <div class="panel">
-      <h2>1. Conversation</h2>
-      <div id="conversation"><div class="empty">No conversation yet.</div></div>
-    </div>
-    <div class="panel">
-      <h2>2. Checks Performed</h2>
-      <div id="checks"><div class="empty">No checks yet.</div></div>
-    </div>
-    <div class="panel">
-      <h2>3. Negotiation Workflow</h2>
-      <div id="negotiation"><div class="empty">No negotiation yet.</div></div>
-    </div>
-    <div class="panel">
-      <h2>4. Steps Completed</h2>
-      <div id="steps"><div class="empty">No activity yet.</div></div>
-    </div>
+    <div class="panel"><h2>1. Conversation</h2><div id="conversation"><div class="empty">No conversation yet.</div></div></div>
+    <div class="panel"><h2>2. Checks Performed</h2><div id="checks"><div class="empty">No checks yet.</div></div></div>
+    <div class="panel"><h2>3. Negotiation Workflow</h2><div id="negotiation"><div class="empty">No negotiation yet.</div></div></div>
+    <div class="panel"><h2>4. Steps Completed</h2><div id="steps"><div class="empty">No activity yet.</div></div></div>
   </div>
-
+  <footer id="dbStats"></footer>
 <script>
 async function load() {
   const id = document.getElementById('customerId').value || '1';
   try {
     const res = await fetch(`/ubp/v1/agent/state/${id}`);
-    if (!res.ok) { renderEmpty(); return; }
-    const data = await res.json();
-    renderConversation(data.conversation);
-    renderChecks(data.checks);
-    renderNegotiation(data.negotiation);
-    renderSteps(data.steps, data.final_decision);
+    if (!res.ok) { renderEmpty(); } else {
+      const data = await res.json();
+      renderConversation(data.conversation);
+      renderChecks(data.checks);
+      renderNegotiation(data.negotiation);
+      renderSteps(data.steps, data.final_decision);
+    }
   } catch (e) { renderEmpty(); }
+  try {
+    const statsRes = await fetch('/ubp/v1/agent/db-stats');
+    const stats = await statsRes.json();
+    document.getElementById('dbStats').textContent =
+      `DB size: ${stats.db_size_mb} MB / ${stats.cap_mb} MB cap -- ${stats.customer_records} customer records stored`;
+  } catch (e) {}
 }
 function renderEmpty() {
   ['conversation','checks','negotiation','steps'].forEach(id => {
@@ -536,42 +654,23 @@ function renderEmpty() {
 function renderConversation(items) {
   const el = document.getElementById('conversation');
   if (!items || !items.length) { el.innerHTML = '<div class="empty">No conversation yet.</div>'; return; }
-  el.innerHTML = items.map(m => `
-    <div class="msg ${m.role}">
-      <div class="role">${m.role.replace('_',' ')}</div>
-      <div>${m.message}</div>
-    </div>`).join('');
+  el.innerHTML = items.map(m => `<div class="msg ${m.role}"><div class="role">${m.role.replace('_',' ')}</div><div>${m.message}</div></div>`).join('');
 }
 function renderChecks(items) {
   const el = document.getElementById('checks');
   if (!items || !items.length) { el.innerHTML = '<div class="empty">No checks yet.</div>'; return; }
-  el.innerHTML = items.map(c => `
-    <div class="check">
-      <div><strong>${c.name}</strong><br><span style="color:var(--muted)">${c.detail}</span></div>
-      <span class="badge ${c.passed ? 'ok' : 'bad'}">${c.passed ? 'PASS' : 'FLAG'}</span>
-    </div>`).join('');
+  el.innerHTML = items.map(c => `<div class="check"><div><strong>${c.name}</strong><br><span style="color:var(--muted)">${c.detail}</span></div><span class="badge ${c.passed ? 'ok' : 'bad'}">${c.passed ? 'PASS' : 'FLAG'}</span></div>`).join('');
 }
 function renderNegotiation(items) {
   const el = document.getElementById('negotiation');
   if (!items || !items.length) { el.innerHTML = '<div class="empty">No negotiation yet.</div>'; return; }
-  el.innerHTML = items.map(r => `
-    <div class="round">
-      <span class="who">Round ${r.round} -- ${r.who}</span>
-      <span>${r.rate}% -- ${r.note}</span>
-    </div>`).join('');
+  el.innerHTML = items.map(r => `<div class="round"><span class="who">Round ${r.round} -- ${r.who}</span><span>${r.rate}% -- ${r.note}</span></div>`).join('');
 }
 function renderSteps(items, decision) {
   const el = document.getElementById('steps');
   if (!items || !items.length) { el.innerHTML = '<div class="empty">No activity yet.</div>'; return; }
-  let html = items.map(s => `
-    <div class="step">
-      <div class="dot ${s.status}"></div>
-      <div class="label">${s.step}</div>
-      <div class="status">${s.status.replace('_',' ')}</div>
-    </div>`).join('');
-  if (decision) {
-    html += `<div class="verdict">${decision.answer || JSON.stringify(decision)}</div>`;
-  }
+  let html = items.map(s => `<div class="step"><div class="dot ${s.status}"></div><div class="label">${s.step}</div><div class="status">${s.status.replace('_',' ')}</div></div>`).join('');
+  if (decision) { html += `<div class="verdict">${decision.answer || JSON.stringify(decision)}</div>`; }
   el.innerHTML = html;
 }
 load();
