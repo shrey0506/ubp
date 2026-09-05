@@ -9,8 +9,18 @@ from mcp.server.transport_security import TransportSecuritySettings
 # Target deployed Bank Agent URL
 BANK_AGENT_URL = "https://ubp-bank-agent.onrender.com/ubp/v1/agent"
 
-# Initialize FastMCP Server
-mcp = FastMCP("Lloyds-Bank-UBP-Gateway")
+# Initialize FastMCP Server.
+# transport_security is set on the constructor (mcp 1.x API) --
+# without allowed_hosts matching your real Render hostname, every
+# production request gets rejected with 421 "Invalid Host header"
+# because the SDK defaults to localhost-only DNS-rebinding protection.
+mcp = FastMCP(
+    "Lloyds-Bank-UBP-Gateway",
+    transport_security=TransportSecuritySettings(
+        allowed_hosts=["ubp-gateway.onrender.com"],
+        allowed_origins=["https://ubp-gateway.onrender.com"],
+    ),
+)
 
 
 # Define the tool that MCP clients (ChatGPT / Claude) can natively discover & call
@@ -41,16 +51,9 @@ async def lloyds_bank_workflow(
             return f"MCP Gateway Connection Error: {str(e)}"
 
 
-# Build the Streamable HTTP ASGI app (replaces the old sse_app()).
-# transport_security allowlists the real production Host header --
-# without this, every request gets rejected with 421 "Invalid Host header"
-# because the SDK's DNS-rebinding protection defaults to localhost-only.
-mcp_asgi_app = mcp.streamable_http_app(
-    transport_security=TransportSecuritySettings(
-        allowed_hosts=["ubp-gateway.onrender.com"],
-        allowed_origins=["https://ubp-gateway.onrender.com"],
-    )
-)
+# Build the Streamable HTTP ASGI app -- reads transport_security
+# from the FastMCP instance above, no args needed here.
+mcp_asgi_app = mcp.streamable_http_app()
 
 
 # FastAPI does NOT auto-run a mounted sub-app's lifespan.
